@@ -29,12 +29,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class TelegramBaleForwarder:
+class TelegramChannelBaleForwarder:
     def __init__(self):
         # Load configuration from environment variables
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.bale_token = os.getenv('BALE_BOT_TOKEN')
         self.bale_chat_id = os.getenv('BALE_CHAT_ID')
+        self.source_channel = os.getenv('SOURCE_CHANNEL')  # Default to your channel
         
         # Validate required environment variables
         if not all([self.telegram_token, self.bale_token, self.bale_chat_id]):
@@ -49,9 +50,38 @@ class TelegramBaleForwarder:
         self.running = False
         self.media_groups = defaultdict(list)
         self.media_group_timeout = 5
+        self.source_channel_id = None  # Will be resolved from username
+
+    def resolve_channel_id(self) -> Optional[int]:
+        """Resolve channel username to chat ID"""
+        try:
+            response = requests.post(
+                f"{self.telegram_base_url}/getChat",
+                json={'chat_id': self.source_channel},
+                headers={'Content-Type': 'application/json'},
+                timeout=10
+            )
+            
+            result = response.json()
+            if result.get('ok'):
+                chat_info = result.get('result', {})
+                chat_id = chat_info.get('id')
+                chat_title = chat_info.get('title', 'Unknown')
+                chat_type = chat_info.get('type', 'Unknown')
+                
+                logger.info(f"Source channel resolved: {chat_title} (ID: {chat_id}, Type: {chat_type})")
+                return chat_id
+            else:
+                error_description = result.get('description', 'Unknown error')
+                logger.error(f"Failed to resolve channel: {error_description}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error resolving channel ID: {e}")
+            return None
 
     def get_telegram_updates(self) -> List[Dict]:
-        """Get updates from Telegram bot API"""
+        """Get updates from Telegram bot API and filter for source channel"""
         try:
             params = {
                 'offset': self.last_update_id + 1,
@@ -68,7 +98,32 @@ class TelegramBaleForwarder:
             
             data = response.json()
             if data.get('ok') and data.get('result'):
-                return data['result']
+                # Filter updates to include both messages and channel posts from our source channel
+                filtered_updates = []
+                for update in data['result']:
+                    # Check for both regular messages and channel posts
+                    message = None
+                    if 'message' in update:
+                        message = update['message']
+                        message_type = "message"
+                    elif 'channel_post' in update:
+                        message = update['channel_post']
+                        message_type = "channel_post"
+                        # Convert channel_post to message format for processing
+                        update['message'] = message
+                    
+                    if message:
+                        chat = message.get('chat', {})
+                        chat_id = chat.get('id')
+                        
+                        # Check if message is from our source channel
+                        if chat_id == self.source_channel_id:
+                            filtered_updates.append(update)
+                            logger.info(f"New {message_type} from source channel: {message.get('message_id')}")
+                        else:
+                            logger.debug(f"Ignoring message from other chat: {chat_id}")
+                
+                return filtered_updates
             return []
             
         except Exception as e:
@@ -439,7 +494,7 @@ class TelegramBaleForwarder:
         if not messages:
             return
         
-        logger.info(f"Processing media group with {len(messages)} items")
+        logger.info(f"Processing media group with {len(messages)} items from channel")
         
         # Get caption, entities and reply_markup from first message
         first_msg = messages[0]
@@ -566,7 +621,7 @@ class TelegramBaleForwarder:
 
     def start_polling(self):
         """Start polling for updates"""
-        logger.info("Starting message polling...")
+        logger.info(f"Starting to monitor channel: {self.source_channel}")
         self.running = True
         
         while self.running:
@@ -591,7 +646,7 @@ class TelegramBaleForwarder:
 
     def run(self):
         """Main run method"""
-        logger.info("Telegram to Bale Forwarder v1.0")
+        logger.info("Telegram Channel to Bale Forwarder v1.0")
         logger.info("Testing API connections...")
         
         try:
@@ -605,6 +660,13 @@ class TelegramBaleForwarder:
                 logger.error("Telegram API: Failed to connect")
                 return
             
+            # Resolve source channel ID
+            logger.info(f"Resolving source channel: {self.source_channel}")
+            self.source_channel_id = self.resolve_channel_id()
+            if not self.source_channel_id:
+                logger.error("Failed to resolve source channel. Make sure the bot is admin in the channel.")
+                return
+            
             # Test Bale connection
             bale_response = requests.get(f"{self.bale_base_url}/getMe", timeout=10)
             if bale_response.json().get('ok'):
@@ -613,8 +675,9 @@ class TelegramBaleForwarder:
                 logger.error("Bale API: Failed to connect")
                 return
             
+            logger.info(f"Source channel: {self.source_channel} (ID: {self.source_channel_id})")
             logger.info(f"Target chat: {self.bale_chat_id}")
-            logger.info("Bot ready to forward messages")
+            logger.info("Bot ready to monitor channel and forward posts")
             logger.info("Press Ctrl+C to stop")
             
             self.start_polling()
@@ -625,7 +688,7 @@ class TelegramBaleForwarder:
 
 if __name__ == "__main__":
     try:
-        forwarder = TelegramBaleForwarder()
+        forwarder = TelegramChannelBaleForwarder()
         forwarder.run()
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
@@ -633,3 +696,4 @@ if __name__ == "__main__":
         print("TELEGRAM_BOT_TOKEN=your_telegram_bot_token")
         print("BALE_BOT_TOKEN=your_bale_bot_token") 
         print("BALE_CHAT_ID=@your_bale_channel")
+        print("SOURCE_CHANNEL=@your_telegram_channel")
